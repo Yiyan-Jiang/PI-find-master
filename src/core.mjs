@@ -203,7 +203,22 @@ export async function discover(workspace) {
 /** 按真实路径加载目标文件的祖先规则；子目录规则不泄漏到兄弟目录。 */
 export async function rulesFor(workspace, target) {
   const root = await fs.realpath(workspace);
-  const resolved = path.resolve(root, target || root);
+  let resolved = path.resolve(root, target || root);
+  let ancestor = resolved;
+  const missing = [];
+  // 短路径与目录别名先统一为真实路径；新文件沿已有祖先解析。
+  while (true) {
+    try {
+      resolved = path.join(await fs.realpath(ancestor), ...missing);
+      break;
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) return [];
+      missing.unshift(path.basename(ancestor));
+      ancestor = parent;
+    }
+  }
   if (!within(root, resolved)) return [];
   let dir = resolved;
   try {

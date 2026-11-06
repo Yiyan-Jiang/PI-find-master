@@ -48,6 +48,30 @@ try {
   await fs.rm(path.join(temp, 'broken'), { recursive: true });
   const rootRules = await rulesFor(temp, temp);
   assert.equal(rootRules.length, 1);
+  // 用真实目录别名覆盖 Windows 短路径与真实路径混用的同类场景。
+  const alias = temp + '-alias';
+  await fs.symlink(temp, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  try {
+    const aliasRules = await rulesFor(alias, alias);
+    assert.equal(aliasRules.length, 1, '工作区路径别名必须正确加载根规则');
+    const aliasSubRules = await rulesFor(alias, path.join(alias, 'frontend', 'src', 'new.ts'));
+    assert.equal(aliasSubRules.length, 2, '未创建文件的祖先也应映射到真实工作区');
+    assert.equal((await rulesFor(alias, 'frontend/src/new.ts')).length, 2);
+    const outside = temp + '-outside';
+    await fs.mkdir(outside);
+    const external = path.join(temp, 'external');
+    try {
+      await fs.writeFile(path.join(outside, 'AGENTS.md'), 'OUTSIDE_RULE');
+      await fs.symlink(outside, external, process.platform === 'win32' ? 'junction' : 'dir');
+      assert.deepEqual(await rulesFor(alias, path.join(alias, 'external')), []);
+      assert.deepEqual(await rulesFor(alias, path.join(alias, 'external', 'new', 'file.ts')), []);
+    } finally {
+      await fs.rm(external, { recursive: true, force: true });
+      await fs.rm(outside, { recursive: true, force: true });
+    }
+  } finally {
+    await fs.unlink(alias);
+  }
   const subRules = await rulesFor(
     temp,
     path.join(temp, 'frontend', 'src', 'a.ts'),
@@ -55,6 +79,18 @@ try {
   assert.equal(subRules.length, 2);
   assert.ok(subRules[1].text.includes('FRONTEND_RULE'));
   assert.equal((await rulesFor(temp, path.dirname(temp))).length, 0);
+  if (process.platform === 'win32') {
+    // 不存在的盘符必须返回空规则，不能在盘符根目录无限查找祖先。
+    for (const drive of ['Z', 'Y', 'X', 'W']) {
+      try {
+        await fs.stat(drive + ':\\');
+      } catch (e) {
+        if (e.code !== 'ENOENT') throw e;
+        assert.deepEqual(await rulesFor(temp, drive + ':\\missing\\file.ts'), []);
+        break;
+      }
+    }
+  }
   const before = await sourceFingerprint(temp);
   const marker = path.join(temp, 'must-not-exist');
   const failure = await runSteps(
