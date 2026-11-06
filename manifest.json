@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "local.pi-find-master",
   "name": "Pi Find Master 工程工具与验收",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "main": "main.cjs",
-  "description": "发现项目环境，按作用域加载规则，执行并核对源码绑定的验收证据，持久记录任务与子代理交接。",
+  "description": "发现与执行工程入口，按需记录任务、整理交接并核对证据；仅显式交付入口使用门禁。",
   "permissions": ["agent.extension"],
   "contributes": {
     "agentExtensions": ["src/extension.mjs"]

@@ -28,14 +28,17 @@ export async function planAcceptance(workspace, { base = 'HEAD' } = {}) {
     if (!configured) return { ...result, reason: '未配置新版 acceptance' };
     if (typeof base !== 'string' || !base.length || base.includes('\0'))
       throw Error('base 必须为非空 Git ref');
-    const baseCommit = (
-      await git(root, [
-        'rev-parse',
-        '--verify',
-        '--end-of-options',
-        `${base}^{commit}`,
-      ])
-    ).trim();
+    let baseCommit;
+    try {
+      baseCommit = (await git(root, ['rev-parse', '--verify', '--end-of-options', `${base}^{commit}`])).trim();
+    } catch (error) {
+      if (base !== 'HEAD') throw error;
+      // 无首次提交时不伪造变更基准，返回完整候选供按需选择。
+      return { ...result, configured, ok: true, baseCommit: null,
+        reasonCode: 'no_head', reason: '没有可解析的 HEAD，未计算变更影响；返回完整候选。',
+        profiles: Object.entries(config.profiles).map(([id,p]) => ({ id, kind:p.kind, description:p.description || '', configured:true })),
+        note };
+    }
     if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(baseCommit))
       throw Error('Git 未返回单一有效的基准 commit');
     result.baseCommit = baseCommit;

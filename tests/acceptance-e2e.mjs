@@ -196,8 +196,8 @@ try {
   await fs.writeFile(path.join(root, 'source.txt'), 'hello\n');
   check(call('init').status === 0, 'init creates public configuration');
   check(
-    call('status').data.profiles[0].status === 'blocked',
-    'repository without HEAD is clearly blocked',
+    call('status').data.profiles[0].status === 'not_run',
+    'repository without HEAD can query development evidence',
   );
   const config = {
     acceptance: {
@@ -246,6 +246,9 @@ try {
     '<testsuites tests="1" failures="0" errors="0" skipped="0"><testsuite tests="1"><testcase name="real"/></testsuite></testsuites>';
   await writeConfig();
   await report(good);
+  check(call('run', 'command').status === 0, 'unborn Git permits real command acceptance');
+  check(call('plan').data.reasonCode === 'no_head', 'unborn Git returns complete candidate plan');
+  check(call('gate', 'push').data.profiles[0].status === 'blocked', 'unborn Git delivery remains blocked');
   exec('git', ['add', '.']);
   exec('git', ['commit', '-qm', 'fixture']);
   const publicBefore = await fs.readFile(

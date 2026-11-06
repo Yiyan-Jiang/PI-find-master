@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { getAcceptanceStatus, safeAcceptancePath } from './acceptance.mjs';
+import { getAcceptanceStatus, safeAcceptancePath, lockInfo } from './acceptance.mjs';
 
 const validId = (value) =>
   typeof value === 'string' && /^[a-z0-9][a-z0-9._-]{0,63}$/i.test(value);
@@ -111,7 +111,8 @@ async function transact(root, taskId, change) {
     lock = await fs.open(file + '.lock', 'wx');
   } catch (error) {
     if (error.code === 'EEXIST')
-      throw Error(`任务正在更新或有遗留锁，请核对后重试：${file}.lock`);
+      { const info = await lockInfo(file + '.lock');
+        throw Object.assign(Error(`任务正在更新或有遗留锁，请核对后重试：${file}.lock`), { lock: info }); }
     throw error;
   }
   const temporary = `${file}.${crypto.randomUUID()}.tmp`;
@@ -397,18 +398,14 @@ export async function taskStatus(root, input) {
     };
   });
   const openBlockers = task.blockers.filter((blocker) => !blocker.resolvedAt);
-  const status = openBlockers.length
-    ? 'blocked'
-    : requirements.length &&
-        requirements.every((requirement) => requirement.status === 'passed')
-      ? 'passed'
-      : requirements.find((requirement) => requirement.status !== 'passed')
-          ?.status || 'unconfigured';
+  const evidenceStatus = requirements.length && requirements.every(r => r.status === 'passed')
+    ? 'passed' : requirements.find(r => r.status !== 'passed')?.status || 'unconfigured';
   return {
     id: task.id,
     title: task.title,
     revision: task.revision,
-    status,
+    evidenceStatus,
+    note: '仅汇总关联证据；事项不裁决任务完成，不代表交付通过。',
     requirements,
     openBlockers,
     decisions: task.decisions,

@@ -54,7 +54,7 @@ try {
     ['复用项目已有检查入口'],
   );
   assert.equal(
-    success('taskStatus', { id: 'frontend' }).status,
+    success('taskStatus', { id: 'frontend' }).evidenceStatus,
     'unconfigured',
   );
   assert.notEqual(

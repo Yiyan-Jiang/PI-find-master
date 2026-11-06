@@ -265,14 +265,20 @@ export async function rulesFor(workspace, target) {
 export async function runSteps(root, steps, options = {}) {
   const results = [];
   let receipt;
-  const before = options.recordAs ? await sourceFingerprint(root) : null;
+  let before, evidenceError;
+  if (options.recordAs) {
+    try { before = await sourceFingerprint(root); }
+    catch (error) { evidenceError = error.message; }
+  }
   for (const step of steps) {
+    try {
     if (options.signal?.aborted) {
       results.push({
         command: step.command,
         args: step.args || [],
         cwd: path.resolve(root, step.cwd || '.'),
         exitCode: null,
+        started: false,
         aborted: true,
         timedOut: false,
         stdout: '',
@@ -305,9 +311,11 @@ export async function runSteps(root, steps, options = {}) {
       let stdout = '',
         stderr = '',
         spawnError,
+        started = false,
         inputError,
         outputBytes = 0,
         writes = Promise.resolve();
+      child.once('spawn', () => { started = true; });
       const limit = 512000;
       const capture = (b) => {
         outputBytes += b.length;
@@ -368,25 +376,15 @@ export async function runSteps(root, steps, options = {}) {
       child.once('close', (code, signal) => {
         clearTimeout(timer);
         options.signal?.removeEventListener('abort', abort);
-        writes.then(
-          () =>
-            resolve({
-              command: step.command,
-              args: step.args || [],
-              cwd,
-              exitCode: spawnError || inputError ? null : code,
-              error: (spawnError || inputError)?.message,
-              signal,
-              stdout,
-              stderr,
-              outputTruncated: outputBytes > limit,
-              logPath,
-              timedOut,
-              aborted,
-              durationMs: Date.now() - start,
-            }),
-          reject,
-        );
+        const observed = {
+          command: step.command, args: step.args || [], cwd, started,
+          exitCode: spawnError || inputError ? null : code,
+          error: (spawnError || inputError)?.message, signal, stdout, stderr,
+          outputTruncated: outputBytes > limit, logPath, timedOut, aborted,
+          durationMs: Date.now() - start,
+        };
+        writes.then(() => resolve(observed),
+          error => resolve({ ...observed, logError: error.message }));
       });
     });
     results.push(result);
@@ -400,30 +398,36 @@ export async function runSteps(root, steps, options = {}) {
         '\n检查没有报告要求的实际通过结果（不能把全跳过当成通过）。';
       break;
     }
+    } catch (error) {
+      // 后续步骤的准备失败不能抹掉前面已经产生的真实副作用。
+      results.push({ command: step.command, args: step.args || [],
+        cwd: path.resolve(root, String(step.cwd || '.')), started: false,
+        exitCode: null, error: error.message, stdout: '', stderr: error.message,
+        aborted: false, timedOut: false, durationMs: 0 });
+      break;
+    }
   }
   const ok =
     results.length === steps.length &&
     results.length > 0 &&
     results.every((s) => s.exitCode === 0 && !s.timedOut && !s.aborted);
-  if (options.recordAs) {
-    const after = await sourceFingerprint(root);
-    const dir = path.join(root, '.local', 'pi-find');
-    await fs.mkdir(dir, { recursive: true });
-    receipt = {
-      kind: options.recordAs,
-      ok: ok && before === after,
-      fingerprint: after,
-      sourceChangedDuringRun: before !== after,
-      steps: results,
-      createdAt: new Date().toISOString(),
-      commandsHash: hash(steps),
-    };
-    await fs.writeFile(
-      path.join(dir, options.recordAs + '.json'),
-      JSON.stringify(receipt, null, 2),
-    );
+  evidenceError ||= results.find(step => step.logError)?.logError;
+  if (options.recordAs && !evidenceError) {
+    try {
+      const after = await sourceFingerprint(root);
+      const dir = path.join(root, '.local', 'pi-find');
+      await fs.mkdir(dir, { recursive: true });
+      receipt = {
+        kind: options.recordAs, ok: ok && before === after, fingerprint: after,
+        sourceChangedDuringRun: before !== after, steps: results,
+        createdAt: new Date().toISOString(), commandsHash: hash(steps),
+      };
+      await fs.writeFile(path.join(dir, options.recordAs + '.json'), JSON.stringify(receipt, null, 2));
+      if (!receipt.ok && ok) evidenceError = '执行前后源码变化，结果不能作为当前源码证据';
+    } catch (error) { evidenceError = error.message; }
   }
-  return { ok: ok && (!receipt || receipt.ok), steps: results, receipt };
+  return { ok: ok && !evidenceError && (!receipt || receipt.ok), executionOk: ok,
+    started: results.some(step => step.started), evidenceError, steps: results, receipt };
 }
 const hash = (x) =>
   crypto

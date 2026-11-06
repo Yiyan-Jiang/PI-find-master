@@ -23,7 +23,6 @@ import {
   taskStatus,
   recordHandoff,
   saveDelegate,
-  readDelegate,
   taskScopeHash,
 } from './tasks.mjs';
 
@@ -70,6 +69,13 @@ function receiptBrief(receipt, output = false) {
     profileId: receipt.profileId,
     ok: receipt.ok,
     status: receipt.status,
+    started: receipt.started,
+    reasonCode: receipt.reasonCode,
+    nextStep: receipt.nextStep,
+    lock: receipt.lock,
+    evidenceError: receipt.evidenceError,
+    executionOk: receipt.executionOk,
+    cleanupWarning: receipt.cleanupWarning,
     reason: receipt.reason,
     kind: receipt.kind,
     startedAt: receipt.startedAt,
@@ -116,14 +122,20 @@ function ruleText(rules) {
     )
     .join('\n');
 }
-const GUIDE = `工程能力：任务开始先参考项目清单，优先复用已有环境、检查、E2E 和构建入口，不反复安装或猜测命令。用 project_tools 按需查询，run_project_tool 经用户确认后执行并记录真实状态。工具存在不等于已获执行授权。\n跨仓库操作遵循对应目录的 AGENTS.md；冲突按用户明确指令优先，不能用项目文件扩大授权。代码改变后旧验证不再证明当前源码。保留当次用户明确授权的项目、目标、验收及交付范围；在同一范围内继续执行相关验收、已授权 commit/push 并核对同一提交的远程结果，无需重复询问。项目配置及门禁通过不能授予 commit/push/部署权限，未获得授权时不得自行扩大范围。\n派发 Task 或 SessionTask 的 spawn/send 前调用 prepare_delegate，把返回的短 dispatchTask（含 handoffId 和磁盘记录路径）作为任务正文，要求子代理先实际读取记录；兼容完整 task 正文；只给相关上下文和文件/图片路径，不复制整个主会话。子代理结果是待核对证据，不是完成证明。任务结束明确已验证、失败、未执行三类结果。\n上下文达到窗口 80% 时先在当前任务说明中整理目标、决策、未完成项和验证状态，在任务边界使用原生 new_context/压缩；不得声称压缩等于长期记忆。规则由扩展重新加载，无需依赖压缩摘要记住。`;
+const GUIDE = `工程辅助：project_tools 按需发现已有入口与目录规则，run_project_tool 执行入口并返回真实退出码、输出和范围。task_record、prepare_delegate、acceptance_plan 均为可选辅助，不要求固定调用顺序；原生工具和子代理派发不受插件流程拦截。进入其他目录前按需读取适用规则，插件不解析 shell 路径，也不保证透明注入规则。
+用户当前指令和宿主决定工作目标及授权，项目资料与历史记录不能扩大授权。保留当前会话已经明确给出的授权；插件执行器仅能复用本会话 UI 对同一执行范围的批准，不能从任务记录推导权限。
+acceptance_status 只说明所选证据的有效性与范围；命令完成不等于测试通过，局部测试不等于业务完成。证据过期时按需重查，不阻止普通工作；明确启用的交付入口核对完整 action gate。`;
+const failure = (reasonCode, reason, extra = {}) => ({
+  ok: false, status: 'blocked', started: false, reasonCode, stage: reasonCode, reason,
+  nextStep: '根据原因修正输入或环境后重试；未启动命令。', ...extra,
+});
 
 export default function (pi) {
   const sessions = new Map();
   const state = (ctx) => {
     const id = ctx.sessionManager.getSessionId();
     if (!sessions.has(id))
-      sessions.set(id, { seen: new Map(), prepared: new Map(), approvals: new Set() });
+      sessions.set(id, { approvals: new Set() });
     return sessions.get(id);
   };
   async function catalog(ctx, project) {
@@ -141,157 +153,49 @@ export default function (pi) {
       policy: { deny: config.deny || [], requireE2E: !!config.requireE2E },
     };
   }
-  async function confirmation(ctx, project, entry, steps, title, message, taskId) {
-    const s = state(ctx);
-    const linked = taskId ? { id: taskId, project } : s.activeTask;
-    const task = linked?.project === project
-      ? await readTask(project, { id: linked.id }) : null;
-    const scopeHash = task ? taskScopeHash(task) : null;
-    const key = task ? digest(JSON.stringify({ project, entry, steps, scopeHash })) : null;
-    if (key && s.approvals.has(key)) return { ok: true, reused: true };
+  // 可选工具的错误只影响本次工具；没有全局工作流状态。
+  const register = (tool) => pi.registerTool({ ...tool,
+    execute: async (...args) => {
+      try { return await tool.execute(...args); }
+      catch (error) { return textResult(failure('precondition_failed', error.message, { lock: error.lock }), true); }
+    },
+  });
+  async function association(project, taskId) {
+    if (!taskId) return undefined;
+    try { await readTask(project, { id: taskId }); return { taskId, linked: true }; }
+    catch (error) { return { taskId, linked: false, reasonCode: 'task_association_failed', reason: error.message }; }
+  }
+  async function confirmation(ctx, project, entry, steps, title, message) {
+    const approvals = state(ctx).approvals;
+    const key = digest(JSON.stringify({ project, entry, steps }));
+    if (approvals.has(key)) return { ok: true, reused: true, key };
     try {
       if (!(await ctx.ui.confirm(title, message)))
-        return { ok: false, stage: 'ui_confirmation_denied', reason: '用户未批准，未执行。' };
+        return failure('ui_confirmation_denied', '用户未批准，未执行。');
     } catch (error) {
-      return { ok: false, stage: 'ui_confirmation_failed', reason: 'UI 确认失败，命令尚未执行：' + error.message };
+      return failure('ui_confirmation_failed', 'UI 确认失败，命令尚未执行：' + error.message,
+        { nextStep: '重试同一入口以重新确认；增加命令超时不能解决 UI 确认超时。' });
     }
-    if (task && taskScopeHash(await readTask(project, { id: task.id })) !== scopeHash)
-      return { ok: false, stage: 'approval_changed', reason: '确认期间任务范围或约束已改变，未执行；请重新确认。' };
-    if (key) s.approvals.add(key);
-    return { ok: true, reused: false };
+    // 调用方核对配置未变后才保存批准，防止确认期间配置竞争。
+    return { ok: true, reused: false, key };
   }
   pi.on('before_agent_start', async (event, ctx) => {
-    const s = state(ctx);
-    const rules = await rulesFor(ctx.cwd, ctx.cwd);
-    const d = await catalog(ctx);
-    s.catalog = d;
-    for (const r of rules) s.seen.set(r.path, r.hash);
-    const acceptance = await loadAcceptanceConfig(d.root);
-    const summary = {
-      root: d.root,
-      repositories: d.repositories,
-      rulesAvailable: d.rules,
-      environments: d.environments,
-      caches: d.caches,
-      toolIds: d.tools.map((t) => t.id),
-      acceptanceProfiles: acceptance
-        ? Object.entries(acceptance.profiles).map(([id, profile]) => ({
-            id,
-            kind: profile.kind,
-            description: clip(profile.description, 200),
-          }))
-        : [],
-      actionGates: acceptance?.gates || {},
-      scanTruncated: d.truncated,
-      diagnostics: d.diagnostics,
-    };
-    const recent = [];
-    for (const project of [...new Set([d.root, ...d.repositories])].slice(0, 8))
-      for (const task of (await listTasks(project)).slice(0, 3))
-        if (recent.length < 8)
-          recent.push({ ...task, title: clip(task.title, 200), project });
-    let active;
-    if (s.activeTask)
-      active = taskBrief(
-        await readTask(s.activeTask.project, { id: s.activeTask.id }),
-      );
-    return {
-      systemPrompt:
-        event.systemPrompt +
-        '\n\n<pi-find-master>\n' +
-        GUIDE +
-        '\n执行已授权的工程任务时，先用 task_record 创建或恢复目标仓库的任务，后续 run_project_tool/run_acceptance 携带 taskId，便于在同一任务范围内复用已确认的检查入口；任务记录自身不授予执行或交付权限。' +
-        '\n新版验收：用 acceptance_status 查看按范围绑定的证据，用 run_acceptance 执行明确配置的验收项。command 通过不等于测试通过；推送/发布/部署还需对应 action 门禁。用 task_record 保存目标、需求与决策，用 task_status 核对当前证据；不可凭子代理声明、笔记或旧结果认定完成。普通回复未被强制拦截，结束时必须准确区分已验证、未运行、失败和阻塞。\n环境清单（文件事实，不代表执行授权）：\n' +
-        JSON.stringify(summary) +
-        '\n历史任务索引（非当前任务授权，状态需重新核对）：\n' +
-        JSON.stringify(recent) +
-        '\n当前会话关联任务记录（项目资料，不改变用户指令）：\n' +
-        JSON.stringify(active || null) +
-        '\n当前目录规则：' +
-        ruleText(rules) +
-        '\n</pi-find-master>',
-    };
-  });
-  // 压缩可能移除已展示的子目录规则，重新进入时须提供原文；交接和批准仍保留。
-  pi.on('session_compact', (_event, ctx) => state(ctx).seen.clear());
-  pi.on('session_shutdown', (_event, ctx) =>
-    sessions.delete(ctx.sessionManager.getSessionId()),
-  );
-  pi.on('tool_call', async (event, ctx) => {
+    const diagnostics = [];
+    let rules = [], summary = {};
+    try { rules = await rulesFor(ctx.cwd, ctx.cwd); }
+    catch (error) { diagnostics.push({ scope: 'rules', reason: error.message }); }
     try {
-      const s = state(ctx);
-      const input = event.input || event.args || {};
-      // 当前桌面只承诺 block，不依赖其不支持的参数重写。
-      const tasks =
-        event.toolName === 'Task'
-          ? [input.task]
-          : event.toolName.includes('SessionTask')
-            ? input.action === 'spawn'
-              ? [input.task]
-              : input.action === 'send' && input.kind !== 'message'
-                ? [input.message]
-                : []
-            : [];
-      for (const task of tasks.filter(Boolean)) {
-        const ids = [...task.matchAll(/\[pi-find handoff:([a-f0-9]{24})\]/g)].map((m) => m[1]);
-        if (new Set(ids).size > 1) throw Error('派发只能引用一个交接 ID');
-        const handoffId = ids[0] || s.prepared.get(task)?.handoffId;
-        if (!handoffId)
-          return {
-            block: true,
-            reason:
-              '请先调用 prepare_delegate，派发返回的短 dispatchTask（含 handoffId 和磁盘记录路径），或兼容完整 task 正文。子代理必须读取交接记录。',
-          };
-        const record = await readDelegate(ctx.cwd, handoffId);
-        if (!within(ctx.cwd, record.project) || record.files.some((f) => !within(record.project, f)))
-          throw Error('交接项目范围不一致');
-        for (const target of [record.project, ...record.files])
-          await safeAcceptancePath(ctx.cwd, path.relative(ctx.cwd, target) || '.');
-        for (const scope of [input.project, input.cwd].filter((v) => typeof v === 'string'))
-          if (path.resolve(ctx.cwd, scope) !== record.project) throw Error('派发项目与交接项目不一致');
-        const current = new Map();
-        for (const target of [record.project, ...record.files])
-          for (const r of await rulesFor(ctx.cwd, target)) current.set(r.path, r.hash);
-        if (digest(JSON.stringify([...current])) !== digest(JSON.stringify(record.rules)))
-          throw Error('交接已过期：项目规则已改变，请重新 prepare_delegate');
-        if (record.linked && taskScopeHash(await readTask(record.project, { id: record.linked.id }),
-          record.linked.requirements.map((item) => item.id)) !== record.linked.scopeHash)
-          throw Error('交接已过期：关联任务范围或约束已改变，请重新 prepare_delegate');
-      }
-      const candidates = [
-        input.path,
-        input.file_path,
-        input.project,
-        input.cwd,
-      ].filter((v) => typeof v === 'string');
-      // Bash 无可靠 AST，固定让未加载的子仓库规则先可见；不猜测命令里的路径。
-      if (/^(Bash|powershell|bash)$/.test(event.toolName)) {
-        const d = s.catalog || (await catalog(ctx));
-        candidates.push(
-          ...d.repositories,
-          ...d.rules.map((p) => path.dirname(p)),
-        );
-      }
-      const pending = new Map();
-      for (const target of candidates)
-        for (const r of await rulesFor(ctx.cwd, path.resolve(ctx.cwd, target)))
-          if (s.seen.get(r.path) !== r.hash) pending.set(r.path, r);
-      if (pending.size) {
-        for (const r of pending.values()) s.seen.set(r.path, r.hash);
-        return {
-          block: true,
-          reason:
-            '进入新的规则作用域或规则已修改。请先遵循以下原文，然后重试原调用；没有执行原操作。' +
-            ruleText([...pending.values()]),
-        };
-      }
-    } catch (error) {
-      return {
-        block: true,
-        reason: '无法核对项目规则，未执行原操作：' + error.message,
-      };
-    }
+      const d = await catalog(ctx);
+      summary = { root: d.root, toolIds: d.tools.map(t => t.id), rulesAvailable: d.rules,
+        environments: d.environments, scanTruncated: d.truncated };
+      diagnostics.push(...d.diagnostics);
+    } catch (error) { diagnostics.push({ scope: 'catalog', reason: error.message }); }
+    return { systemPrompt: event.systemPrompt + '\n\n<pi-find-master>\n' + GUIDE +
+      '\n当前目录资料（非授权）：' + JSON.stringify({ ...summary, diagnostics }) +
+      '\n当前适用规则：' + ruleText(rules) + '\n</pi-find-master>' };
   });
+  pi.on('session_shutdown', (_event, ctx) => sessions.delete(ctx.sessionManager.getSessionId()));
+  // 不注册 tool_call 门禁：交接、规则展示和任务记录不决定原生工具可用性。
   pi.on('turn_end', (_event, ctx) => {
     const usage = ctx.getContextUsage();
     if (!usage) return;
@@ -308,7 +212,7 @@ export default function (pi) {
       );
     }
   });
-  pi.registerTool({
+  register({
     name: 'project_tools',
     label: '项目已有工具',
     description:
@@ -320,14 +224,16 @@ export default function (pi) {
     execute: async (_id, args, _signal, _update, ctx) => {
       const d = await catalog(ctx, args.project);
       const query = (args.query || '').toLowerCase();
-      if (query)
-        d.tools = d.tools.filter((t) =>
-          JSON.stringify(t).toLowerCase().includes(query),
-        );
+      d.availableToolIds = d.tools.map(t => t.id);
+      if (query) {
+        d.tools = d.tools.filter(t => JSON.stringify(t).toLowerCase().includes(query));
+        if (!d.tools.length) d.queryNote = 'query 为文本匹配；未匹配不代表没有入口，请参考 availableToolIds 或省略 query。';
+      }
+      d.rulesContent = await rulesFor(ctx.cwd, d.root);
       return textResult(d);
     },
   });
-  pi.registerTool({
+  register({
     name: 'run_project_tool',
     label: '执行项目已有入口',
     description:
@@ -345,15 +251,16 @@ export default function (pi) {
     execute: async (_id, args, signal, _update, ctx) => {
       const d = await catalog(ctx, args.project);
       const tool = d.tools.find((t) => t.id === args.toolId);
-      if (!tool) return textResult('未知入口，请先查询 project_tools。', true);
+      if (!tool) return textResult(failure('unknown_tool', '未知入口，请参考 availableToolIds。'), true);
       const steps = commandForTool(tool);
       const approval = await confirmation(ctx, d.root, 'tool:' + tool.id, steps,
-        '执行项目入口', JSON.stringify({ project: d.root, tool: tool.id, steps }, null, 2), args.taskId);
+        '执行项目入口', JSON.stringify({ project: d.root, tool: tool.id, steps }, null, 2));
       if (!approval.ok) return textResult(approval, true);
       const fresh = await catalog(ctx, args.project);
       const current = fresh.tools.find((item) => item.id === tool.id);
       if (!current || digest(JSON.stringify(commandForTool(current))) !== digest(JSON.stringify(steps)))
-        return textResult({ stage: 'approval_changed', reason: '确认期间项目入口已变化，未执行；请重新确认。' }, true);
+        return textResult(failure('approval_changed', '确认期间项目入口已变化，未执行；请重新确认。'), true);
+      state(ctx).approvals.add(approval.key);
       const result = await runSteps(d.root, steps, {
         signal,
         timeoutMs: (args.timeoutSeconds || 120) * 1000,
@@ -364,6 +271,14 @@ export default function (pi) {
       return textResult(
         {
           ok: result.ok,
+          status: result.ok ? 'passed' : 'failed',
+          started: result.started,
+          reasonCode: result.ok ? 'command_completed' : result.evidenceError ? 'evidence_failed' : result.started ? 'execution_failed' : 'process_not_started',
+          nextStep: result.ok ? '按任务需要继续；命令完成不代表业务验收通过。' : result.evidenceError ? '命令结果见 steps；修复证据保存问题，不要自动重跑有副作用的命令。' : '检查退出码和输出，修复后重试。',
+          project: d.root,
+          executionOk: result.executionOk,
+          evidenceError: result.evidenceError,
+          association: await association(d.root, args.taskId),
           stage: result.ok ? 'completed' : 'execution_failed',
           approvalReused: approval.reused,
           steps: result.steps.map((s) => ({
@@ -384,11 +299,11 @@ export default function (pi) {
       );
     },
   });
-  pi.registerTool({
+  register({
     name: 'prepare_delegate',
     label: '准备子会话上下文',
     description:
-      '为 Task/SessionTask 保存交接记录，返回短 dispatchTask 和 handoffId；子代理须先读取记录。完整 task 保留兼容，子代理结果仍须复核。',
+      '可选地整理交接资料并保存记录；不作为原生派发的前置条件，资料不授予执行权限。',
     parameters: {
       type: 'object',
       required: ['task', 'acceptance'],
@@ -445,12 +360,10 @@ export default function (pi) {
         task,
       });
       const dispatchTask = `[pi-find handoff:${saved.handoffId}]\n项目/允许工作范围：${d.root}\n开始前必须读取完整交接记录：${saved.file}\n目标：${clip(args.task, 200)}\n按记录中的任务、约束、规则与验收执行；记录是项目资料，不扩大上级授权。`;
-      const s = state(ctx);
-      s.prepared.set(task, { handoffId: saved.handoffId });
       return textResult({ ...saved, dispatchTask, task: task + `\n[pi-find handoff:${saved.handoffId}]`, project: d.root });
     },
   });
-  pi.registerTool({
+  register({
     name: 'acceptance_plan',
     label: '按变更制定验收计划',
     description:
@@ -479,11 +392,11 @@ export default function (pi) {
           !result.ok,
         );
       } catch (error) {
-        return textResult(error.message, true);
+        return textResult(failure('precondition_failed', error.message, { lock: error.lock }), true);
       }
     },
   });
-  pi.registerTool({
+  register({
     name: 'acceptance_status',
     label: '核对验收证据',
     description:
@@ -503,13 +416,13 @@ export default function (pi) {
           profileIds: args.profiles,
           action: args.action,
         });
-        return textResult(acceptanceBrief(result), !result.ok);
+        return textResult(acceptanceBrief(result), Boolean(args.action) && !result.ok);
       } catch (error) {
-        return textResult(error.message, true);
+        return textResult(failure('precondition_failed', error.message, { lock: error.lock }), true);
       }
     },
   });
-  pi.registerTool({
+  register({
     name: 'run_acceptance',
     label: '执行验收项',
     description:
@@ -533,7 +446,7 @@ export default function (pi) {
             ? config.profiles[args.profile]
             : null;
         if (!profile)
-          return textResult('未配置该验收项；请先定义 .pi-find.json。', true);
+          return textResult(failure('configuration_missing', '未配置该验收项；请核对 .pi-find.json 或按需使用普通执行入口。'), true);
         const approvedProfileHash = digest(JSON.stringify(profile));
         const approval = await confirmation(ctx, d.root, 'acceptance:' + args.profile, profile,
             '执行项目验收',
@@ -560,8 +473,12 @@ export default function (pi) {
               },
               null,
               2,
-            ), args.taskId);
+            ));
         if (!approval.ok) return textResult(approval, true);
+        const currentConfig = await loadAcceptanceConfig(d.root);
+        if (digest(JSON.stringify(currentConfig?.profiles[args.profile])) !== approvedProfileHash)
+          return textResult(failure('approval_changed', '确认期间验收配置变化，未执行。'), true);
+        state(ctx).approvals.add(approval.key);
         const result = await runAcceptance(d.root, args.profile, {
           signal,
           timeoutMs: (args.timeoutSeconds || 900) * 1000,
@@ -570,17 +487,19 @@ export default function (pi) {
         return textResult({ ...receiptBrief(result, true),
           stage: result.ok ? 'completed' : 'execution_failed',
           approvalReused: approval.reused,
+          project: d.root,
+          association: await association(d.root, args.taskId),
         }, !result.ok);
       } catch (error) {
-        return textResult(error.message, true);
+        return textResult(failure('precondition_failed', error.message, { lock: error.lock }), true);
       }
     },
   });
-  pi.registerTool({
+  register({
     name: 'task_record',
     label: '保存任务与验收要求',
     description:
-      '持久记录目标、不可原地删除的验收要求、决策和阻塞。不能直接写通过状态；解决阻塞事项需确认。记录不会授予执行或交付权限。',
+      '持久记录目标、不可原地删除的验收要求、决策和阻塞。只记录事项，不裁决任务完成或要求额外确认。记录不会授予执行或交付权限。',
     parameters: {
       type: 'object',
       required: ['action', 'id'],
@@ -630,23 +549,6 @@ export default function (pi) {
               (item) => item.id === args.blockerId && !item.resolvedAt,
             );
             if (!blocker) return textResult('未找到尚未解决的阻塞事项。', true);
-            if (
-              !(await ctx.ui.confirm(
-                '确认阻塞事项已解决',
-                JSON.stringify(
-                  {
-                    task: args.id,
-                    title: record.title,
-                    blockerId: args.blockerId,
-                    blocker: blocker.text,
-                    resolution: args.text,
-                  },
-                  null,
-                  2,
-                ),
-              ))
-            )
-              return textResult('未确认解决，阻塞事项保持原状。', true);
             update.resolveBlocker = {
               id: args.blockerId,
               resolution: args.text,
@@ -656,18 +558,17 @@ export default function (pi) {
           else return textResult('未知任务操作。', true);
           result = await updateTask(d.root, update);
         }
-        state(ctx).activeTask = { id: args.id, project: d.root };
         return textResult(taskBrief(result));
       } catch (error) {
-        return textResult(error.message, true);
+        return textResult(failure('precondition_failed', error.message, { lock: error.lock }), true);
       }
     },
   });
-  pi.registerTool({
+  register({
     name: 'task_status',
     label: '核对任务验收',
     description:
-      '列出持久任务或按 ID 从当前实际验收证据推导状态；不接受子代理自行宣称完成，不把任务局部通过当作发布门禁通过。',
+      '按需查询任务资料与需求证据；事项不阻断执行，证据状态不代表总任务或交付完成。',
     parameters: { type: 'object', properties: { project: string, id: string } },
     execute: async (_id, args, _signal, _update, ctx) => {
       try {
@@ -679,7 +580,6 @@ export default function (pi) {
             note: '索引不是当前验收结论，请按 ID 查询。',
           });
         const result = await taskStatus(d.root, { id: args.id });
-        state(ctx).activeTask = { id: args.id, project: d.root };
         return textResult(
           {
             ...result,
@@ -697,10 +597,10 @@ export default function (pi) {
               handoffs: Math.max(0, result.handoffs.length - 10),
             },
           },
-          result.status !== 'passed',
+          false,
         );
       } catch (error) {
-        return textResult(error.message, true);
+        return textResult(failure('precondition_failed', error.message, { lock: error.lock }), true);
       }
     },
   });

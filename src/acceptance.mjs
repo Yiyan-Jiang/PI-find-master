@@ -28,6 +28,20 @@ const keys = (value, allowed, label) =>
   );
 const local = (root) => path.join(root, '.local', 'pi-find', 'acceptance');
 
+/** 锁仅用于诊断，不凭 PID 或时间自动删除，父进程退出不代表子进程结束。 */
+export async function lockInfo(file) {
+  try {
+    const record = JSON.parse(await fs.readFile(file, 'utf8'));
+    let ownerAlive = null;
+    if (Number.isInteger(record.pid) && record.pid > 0) {
+      try { process.kill(record.pid, 0); ownerAlive = true; }
+      catch (error) { if (error.code === 'ESRCH') ownerAlive = false; }
+    }
+    return { pid: record.pid, startedAt: record.startedAt || record.createdAt, ownerAlive,
+      note: 'PID 存活不证明身份；父进程退出不证明子进程结束。' };
+  } catch (error) { return { reason: error.message, ownerAlive: null }; }
+}
+
 /** 检查每层实际祖先；不允许链接目录或链接输入，含尚未存在的输出路径。 */
 export async function safeAcceptancePath(root, relative) {
   ensure(
@@ -604,6 +618,9 @@ export async function runAcceptance(
     profileId,
     ok: false,
     status: 'failed',
+    started: false,
+    reasonCode: 'precondition_failed',
+    nextStep: '核对前置条件后重试；未启动命令。',
     startedAt: new Date().toISOString(),
     sampling: 'before/after only; not an isolation guarantee',
     steps: [],
@@ -624,7 +641,10 @@ export async function runAcceptance(
       );
     } catch (e) {
       if (e.code === 'EEXIST')
-        throw Error('验收执行锁已存在；请等待或人工核对遗留锁');
+        { receipt.lock = await lockInfo(path.join(local(root), 'run.lock'));
+          receipt.reasonCode = 'execution_locked';
+          receipt.nextStep = '核对锁对应进程与子进程是否结束后再恢复；不要仅凭 PID 消失删除锁。';
+          throw Error('验收执行锁已存在；请等待或核对遗留执行'); }
       throw e;
     }
     await atomic(file, {
@@ -653,7 +673,8 @@ export async function runAcceptance(
     }
     receipt.runtime = runtime();
     receipt.environmentHash = environment(p);
-    receipt.head = (await git(root, ['rev-parse', '--verify', 'HEAD'])).trim();
+    try { receipt.head = (await git(root, ['rev-parse', '--verify', 'HEAD'])).trim(); }
+    catch { receipt.head = null; }
     if (signal?.aborted) throw Error('验收已取消');
     for (const step of p.steps) await safeAcceptancePath(root, step.cwd || '.');
     await safeAcceptancePath(root, '.local/pi-find/logs');
@@ -692,7 +713,13 @@ export async function runAcceptance(
       return step;
     });
     const result = await runSteps(root, steps, { signal, timeoutMs });
+    receipt.started = result.started;
+    receipt.executionOk = result.executionOk;
     receipt.steps = result.steps;
+    receipt.reasonCode = result.evidenceError ? 'evidence_failed' : result.ok ? 'evidence_invalid' : result.started ? 'execution_failed' : 'process_not_started';
+    receipt.nextStep = '检查实际步骤、日志和报告；修复对应原因后按需重查。';
+    ensure(!result.evidenceError, result.evidenceError);
+
     for (const step of receipt.steps)
       if (step.logPath) step.logHash = hash(await fs.readFile(step.logPath));
     ensure(result.ok, '命令失败、超时或取消');
@@ -707,6 +734,8 @@ export async function runAcceptance(
     );
     receipt.ok = true;
     receipt.status = 'passed';
+    receipt.reasonCode = p.kind === 'command' ? 'command_completed' : 'tests_passed';
+    receipt.nextStep = '按需继续；证据只覆盖本 profile，交付须查询对应 action。';
     receipt.reason =
       p.kind === 'command'
         ? '命令完成（不证明测试通过）'
@@ -721,18 +750,23 @@ export async function runAcceptance(
     if (ownsLock) {
       try {
         await atomic(file, receipt);
+      } catch (error) {
+        receipt.ok = false;
+        receipt.status = 'failed';
+        receipt.reasonCode = 'evidence_write_failed';
+        receipt.reason = '执行结果已保留，但证据保存失败：' + error.message;
+        receipt.evidenceError = error.message;
+        receipt.nextStep = '执行结果见 steps；修复证据存储，不要自动重复已执行的命令。';
       } finally {
-        await lock?.close();
-        await fs.unlink(path.join(local(root), 'run.lock'));
+        try { await lock?.close(); await fs.unlink(path.join(local(root), 'run.lock')); }
+        catch (error) { receipt.cleanupWarning = error.message; }
       }
-    } else
-      await atomic(
-        await safeAcceptancePath(
-          root,
-          '.local/pi-find/acceptance/attempts/' + crypto.randomUUID() + '.json',
-        ),
-        receipt,
-      );
+    } else {
+      try {
+        await atomic(await safeAcceptancePath(root,
+          '.local/pi-find/acceptance/attempts/' + crypto.randomUUID() + '.json'), receipt);
+      } catch (error) { receipt.evidenceError = error.message; }
+    }
   }
   return receipt;
 }
@@ -815,7 +849,8 @@ export async function getAcceptanceStatus(
     };
   let headError;
   try {
-    await git(root, ['rev-parse', '--verify', 'HEAD']);
+    if (action && ['push', 'release', 'deploy'].includes(action))
+      await git(root, ['rev-parse', '--verify', 'HEAD']);
   } catch (e) {
     headError = '需要真实 Git 仓库和至少一个 HEAD commit：' + e.message;
   }
@@ -829,6 +864,7 @@ export async function getAcceptanceStatus(
     if (headError) {
       item.status = 'blocked';
       item.reason = headError;
+      item.reasonCode = 'head_required';
       continue;
     }
     try {
@@ -849,6 +885,9 @@ export async function getAcceptanceStatus(
       if (lock) {
         item.status = 'blocked';
         item.reason = '项目验收执行锁存在；运行中或遗留锁需核对';
+        item.reasonCode = 'execution_locked';
+        item.lock = await lockInfo(path.join(local(root), 'run.lock'));
+        item.nextStep = '核对该进程与其子进程，运行中等待，遗留执行核实结束后再恢复。';
         continue;
       }
       if (!receipt) {
@@ -859,6 +898,8 @@ export async function getAcceptanceStatus(
       if (!receipt.ok) {
         item.status = receipt.status === 'blocked' ? 'blocked' : 'failed';
         item.reason = receipt.reason;
+        item.reasonCode = receipt.reasonCode || 'execution_failed';
+        item.nextStep = receipt.nextStep;
         continue;
       }
       item.status = 'stale';
@@ -914,6 +955,8 @@ export async function getAcceptanceStatus(
     } catch (e) {
       if (!['stale', 'blocked'].includes(item.status)) item.status = 'blocked';
       item.reason = e.message;
+      item.reasonCode = item.status === 'stale' ? 'evidence_stale' : 'evidence_unavailable';
+      item.nextStep = '按原因核对所选输入与证据；需要该项证明时重新检查，普通工作可继续。';
     }
   }
   // 返回前重新采样证据和配置；不声称多个文件之间存在原子快照。
@@ -948,11 +991,20 @@ export async function getAcceptanceStatus(
         item.reason = e.message;
       }
   }
+  for (const item of profiles) {
+    item.reasonCode ||= item.status === 'passed'
+      ? item.kind === 'command' ? 'command_completed' : 'tests_passed'
+      : item.status === 'not_run' ? 'not_run' : item.status === 'unconfigured' ? 'configuration_missing' : 'evidence_unavailable';
+    item.nextStep ||= item.status === 'passed'
+      ? '该证据仅覆盖所选范围；按需继续。'
+      : '按原因核对配置或重新检查所需项；普通工作可继续。';
+  }
   return {
     configured: true,
     action,
     profiles,
     ok: profiles.length > 0 && profiles.every((p) => p.status === 'passed'),
+    nextStep: '失效项按需重新检查；仅明确启用的交付 gate 阻止交付，普通工作可继续。',
     checkedAt: new Date().toISOString(),
     sampling: 'before/after only; not an atomic snapshot',
   };

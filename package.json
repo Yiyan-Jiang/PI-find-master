@@ -1,6 +1,6 @@
 {
   "name": "pi-find-master",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "description": "Portable project tool discovery and evidence-driven acceptance gates",
   "license": "MIT",
