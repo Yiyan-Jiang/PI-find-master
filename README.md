@@ -10,7 +10,7 @@
 
 <br />
 
-![Version](https://img.shields.io/badge/version-0.2.0-6366f1?style=flat-square)
+![Version](https://img.shields.io/badge/version-0.2.1-6366f1?style=flat-square)
 ![Stage](https://img.shields.io/badge/status-preview-f59e0b?style=flat-square)
 ![Node.js](https://img.shields.io/badge/Node.js-%E2%89%A522-339933?style=flat-square&logo=nodedotjs&logoColor=white)
 [![License](https://img.shields.io/badge/license-MIT-14b8a6?style=flat-square)](LICENSE)
@@ -26,7 +26,7 @@
 
 </div>
 
-> **当前版本：0.2.0 预览版。** 还在不断验证和改进当中
+> **当前版本：0.2.1 预览版。** 还在不断验证和改进当中
 
 ---
 
@@ -214,6 +214,8 @@ node src/cli.mjs gate push --root /path/to/project --json
 
 任务使用 `requirements: [{id, description, profiles}]` 关联验收项。状态由证据推导，不能通过备注或子代理回报直接写成 `passed`。人工验收可登记为 blocker，解决时展示原事项和说明供用户确认。
 
+`prepare_delegate` 把完整交接写入当前工作区 `.local/pi-find/handoffs/`，返回短 `handoffId` 和 `dispatchTask`，以及兼容用的完整 `task`。派发 Task、SessionTask spawn 或非普通消息的 send 时传 `dispatchTask`，子代理开始前须实际读取其中的记录路径。可补充文字，无需逐字重抄长规则；跨用户轮次、压缩和 loader 重载仍可核对记录。项目范围不符、规则哈希或关联任务范围、选中需求及约束改变时拒绝旧交接，须重新准备。交接审计和普通进展备注不会使记录过期；压缩后首次进入规则作用域会重新提供规则原文。扩展只验证与拦截，不会改写宿主工具参数或透明注入正文。
+
 ---
 
 <a id="configuration"></a>
@@ -313,6 +315,8 @@ node src/cli.mjs gate push --root /path/to/project --json
 
 Desktop 确认绑定验收配置哈希。等待确认期间配置发生变化会拒绝执行；敏感环境覆盖值在确认界面遮挡并显示哈希。
 
+同一会话中，入口关联到相同项目的持久任务时（当前 `task_record`/`task_status` 关联，或显式 `taskId`），UI 已批准的相同任务范围、入口和步骤哈希可重复执行；任务、项目、入口或步骤改变会重新确认。未绑定任务时每次确认，拒绝和 UI 请求超时不缓存批准；loader 重载后重新确认。返回 `ui_confirmation_failed` 表示确认传输失败、命令尚未启动，`execution_failed` 表示已经执行但验证失败。配置不能自动批准命令或授予提交、推送权限。当次用户已明确授权的项目、验收和 commit/push 范围应保留并继续完成，交付时核对同一提交的远程结果。
+
 **Pi Find Master 是工程工作流辅助，不是操作系统沙箱。** 扩展使用 `agent.extension` 和 Node 文件/进程 API，命令以运行用户权限执行。项目文件不能扩大授权，普通最终回复也没有强制拦截能力。
 
 插件不会自动修复业务缺陷、安装项目依赖、保证构建缓存命中，或验证远端部署。它不新增调度器、不自动轮询 CI，也不能用任务摘要替代完整长期记忆。
@@ -320,6 +324,8 @@ Desktop 确认绑定验收配置哈希。等待确认期间配置发生变化会
 ### Git hooks 与旧配置
 
 `tools`、`qualitySteps`、`e2eSteps` 及原有收据格式保留兼容，与新版 `acceptance` 独立。旧收据不能提供新版 HEAD 绑定的交付证明；迁移需要显式配置并重新验收。
+
+未配置新版 `acceptance` 时，`acceptance_status` 保持 `configured:false / ok:false`，同时列出旧模式的真实执行入口、配置步骤、收据有效性和实际输出片段。旧收据只证明所列命令覆盖的范围，没有结构化用例计数；局部用例、原生套件、安装版 GUI 和远程 CI 必须分别核对，不能合称全量通过。先确认当前任务所需范围，再按当次授权执行旧入口，或显式迁移为带 JUnit 报告的新版验收项。
 
 ```sh
 python tools/install-git-gates.py

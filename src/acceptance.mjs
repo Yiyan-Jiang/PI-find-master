@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { git, loadConfig, runSteps, readJson, within } from './core.mjs';
+import { git, loadConfig, runSteps, readJson, within, validationStatus } from './core.mjs';
 
 const hash = (value) =>
   crypto
@@ -753,14 +753,41 @@ export async function getAcceptanceStatus(
       reason: e.message,
     };
   }
-  if (!c)
+  if (!c) {
+    const config = await loadConfig(root);
+    const legacy = [];
+    for (const kind of ['quality', 'e2e']) {
+      const steps = config[kind + 'Steps'] || [];
+      const receiptPath = await safeAcceptancePath(root, `.local/pi-find/${kind}.json`);
+      const receipt = await readJson(receiptPath, null);
+      let validity;
+      try { validity = await validationStatus(root, kind, steps); }
+      catch (error) { validity = { valid: false, reason: error.message }; }
+      legacy.push({
+        kind, configured: steps.length > 0, steps,
+        entry: { command: process.execPath, args: [path.join(import.meta.dirname, 'guard.mjs'), 'validate', root, kind] },
+        receipt: receipt ? {
+          path: receiptPath, ok: receipt.ok, createdAt: receipt.createdAt,
+          ...validity,
+          steps: receipt.steps?.map((step) => ({
+            command: step.command, args: step.args, cwd: step.cwd, exitCode: step.exitCode,
+            timedOut: step.timedOut, aborted: step.aborted,
+            stdoutTail: step.stdout?.slice(-1500), stderrTail: step.stderr?.slice(-1500),
+          })),
+        } : null,
+        coverage: '仅覆盖列出的旧模式命令；旧收据无结构化用例计数，不证明完整测试套件、安装版 GUI 或远程 CI 通过。',
+      });
+    }
     return {
       configured: false,
       profiles: [],
       ok: false,
       status: 'unconfigured',
       reason: '未配置新版 acceptance',
+      mode: 'legacy', legacy,
+      nextStep: '核对当前任务所需验收与旧入口的实际选择范围；已授权时执行相关旧入口。需新版证据时显式配置 acceptance 测试项与 JUnit 报告后重新运行，不能把旧收据当全量通过。',
     };
+  }
   if (action !== undefined && profileIds !== undefined)
     return {
       configured: true,

@@ -199,6 +199,22 @@ export async function readTask(root, input) {
   return task;
 }
 
+/** 只绑定任务范围和约束；备注、交接审计、时间戳及 revision 不改变范围。 */
+export function taskScopeHash(task, requirementIds) {
+  const ids = requirementIds === undefined ? null : new Set(requirementIds);
+  const requirements = task.requirements.filter((item) => !ids || ids.has(item.id));
+  return crypto.createHash('sha256').update(JSON.stringify({
+    id: task.id,
+    root: task.root,
+    title: task.title,
+    requirements: requirements.map((item) => ({
+      id: item.id, description: item.description, profiles: [...item.profiles].sort(),
+    })).sort((a, b) => a.id.localeCompare(b.id)),
+    decisions: task.decisions.map((item) => item.text),
+    openBlockers: task.blockers.filter((item) => !item.resolvedAt).map((item) => item.text),
+  })).digest('hex');
+}
+
 /** 追加决策、事项及备注；不允许模型直接修改 passed 或删掉验收要求。 */
 export async function updateTask(root, input) {
   fields(input, [
@@ -317,6 +333,33 @@ export async function recordHandoff(root, input) {
     });
     return task;
   });
+}
+
+/** 短标记只关联本工作区的真实磁盘交接，不依赖模型重抄规则。 */
+export async function saveDelegate(workspace, record) {
+  const root = await fs.realpath(workspace);
+  const dir = await safeAcceptancePath(root, '.local/pi-find/handoffs');
+  await fs.mkdir(dir, { recursive: true });
+  await safeAcceptancePath(root, '.local/pi-find/handoffs');
+  const handoffId = crypto.randomBytes(12).toString('hex');
+  const file = path.join(dir, handoffId + '.json');
+  const value = { ...record, schemaVersion: 1, handoffId, workspace: root };
+  await fs.writeFile(file, JSON.stringify(value, null, 2) + '\n', { flag: 'wx' });
+  return { handoffId, file };
+}
+
+export async function readDelegate(workspace, handoffId) {
+  if (!/^[a-f0-9]{24}$/.test(handoffId)) throw Error('交接 ID 无效');
+  const root = await fs.realpath(workspace);
+  const file = await safeAcceptancePath(root, `.local/pi-find/handoffs/${handoffId}.json`);
+  const stat = await fs.lstat(file);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 500000)
+    throw Error('交接记录必须为小于 500 KB 的普通文件');
+  const record = JSON.parse(await fs.readFile(file, 'utf8'));
+  if (record.schemaVersion !== 1 || record.handoffId !== handoffId || record.workspace !== root ||
+      typeof record.project !== 'string' || !Array.isArray(record.files) || !Array.isArray(record.rules))
+    throw Error('交接记录与当前工作区不一致');
+  return record;
 }
 
 /** 当前验收状态每次从实际证据重新推导；历史笔记和子代理声明不能设置通过。 */

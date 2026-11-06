@@ -22,6 +22,9 @@ import {
   listTasks,
   taskStatus,
   recordHandoff,
+  saveDelegate,
+  readDelegate,
+  taskScopeHash,
 } from './tasks.mjs';
 
 const textResult = (value, isError = false) => ({
@@ -113,14 +116,14 @@ function ruleText(rules) {
     )
     .join('\n');
 }
-const GUIDE = `工程能力：任务开始先参考项目清单，优先复用已有环境、检查、E2E 和构建入口，不反复安装或猜测命令。用 project_tools 按需查询，run_project_tool 经用户确认后执行并记录真实状态。工具存在不等于已获执行授权。\n跨仓库操作遵循对应目录的 AGENTS.md；冲突按用户明确指令优先，不能用项目文件扩大授权。代码改变后旧验证不再证明当前源码。提交、推送和部署仍需要用户授权。\n派发 Task 或 SessionTask 的 spawn/send 前调用 prepare_delegate，把返回的交接正文原样作为任务正文；只给相关上下文和文件/图片路径，不复制整个主会话。子代理结果是待核对证据，不是完成证明。任务结束明确已验证、失败、未执行三类结果。\n上下文达到窗口 80% 时先在当前任务说明中整理目标、决策、未完成项和验证状态，在任务边界使用原生 new_context/压缩；不得声称压缩等于长期记忆。规则由扩展重新加载，无需依赖压缩摘要记住。`;
+const GUIDE = `工程能力：任务开始先参考项目清单，优先复用已有环境、检查、E2E 和构建入口，不反复安装或猜测命令。用 project_tools 按需查询，run_project_tool 经用户确认后执行并记录真实状态。工具存在不等于已获执行授权。\n跨仓库操作遵循对应目录的 AGENTS.md；冲突按用户明确指令优先，不能用项目文件扩大授权。代码改变后旧验证不再证明当前源码。保留当次用户明确授权的项目、目标、验收及交付范围；在同一范围内继续执行相关验收、已授权 commit/push 并核对同一提交的远程结果，无需重复询问。项目配置及门禁通过不能授予 commit/push/部署权限，未获得授权时不得自行扩大范围。\n派发 Task 或 SessionTask 的 spawn/send 前调用 prepare_delegate，把返回的短 dispatchTask（含 handoffId 和磁盘记录路径）作为任务正文，要求子代理先实际读取记录；兼容完整 task 正文；只给相关上下文和文件/图片路径，不复制整个主会话。子代理结果是待核对证据，不是完成证明。任务结束明确已验证、失败、未执行三类结果。\n上下文达到窗口 80% 时先在当前任务说明中整理目标、决策、未完成项和验证状态，在任务边界使用原生 new_context/压缩；不得声称压缩等于长期记忆。规则由扩展重新加载，无需依赖压缩摘要记住。`;
 
 export default function (pi) {
   const sessions = new Map();
   const state = (ctx) => {
     const id = ctx.sessionManager.getSessionId();
     if (!sessions.has(id))
-      sessions.set(id, { seen: new Map(), prepared: new Map() });
+      sessions.set(id, { seen: new Map(), prepared: new Map(), approvals: new Set() });
     return sessions.get(id);
   };
   async function catalog(ctx, project) {
@@ -138,10 +141,27 @@ export default function (pi) {
       policy: { deny: config.deny || [], requireE2E: !!config.requireE2E },
     };
   }
+  async function confirmation(ctx, project, entry, steps, title, message, taskId) {
+    const s = state(ctx);
+    const linked = taskId ? { id: taskId, project } : s.activeTask;
+    const task = linked?.project === project
+      ? await readTask(project, { id: linked.id }) : null;
+    const scopeHash = task ? taskScopeHash(task) : null;
+    const key = task ? digest(JSON.stringify({ project, entry, steps, scopeHash })) : null;
+    if (key && s.approvals.has(key)) return { ok: true, reused: true };
+    try {
+      if (!(await ctx.ui.confirm(title, message)))
+        return { ok: false, stage: 'ui_confirmation_denied', reason: '用户未批准，未执行。' };
+    } catch (error) {
+      return { ok: false, stage: 'ui_confirmation_failed', reason: 'UI 确认失败，命令尚未执行：' + error.message };
+    }
+    if (task && taskScopeHash(await readTask(project, { id: task.id })) !== scopeHash)
+      return { ok: false, stage: 'approval_changed', reason: '确认期间任务范围或约束已改变，未执行；请重新确认。' };
+    if (key) s.approvals.add(key);
+    return { ok: true, reused: false };
+  }
   pi.on('before_agent_start', async (event, ctx) => {
     const s = state(ctx);
-    s.seen.clear();
-    s.prepared.clear();
     const rules = await rulesFor(ctx.cwd, ctx.cwd);
     const d = await catalog(ctx);
     s.catalog = d;
@@ -180,6 +200,7 @@ export default function (pi) {
         event.systemPrompt +
         '\n\n<pi-find-master>\n' +
         GUIDE +
+        '\n执行已授权的工程任务时，先用 task_record 创建或恢复目标仓库的任务，后续 run_project_tool/run_acceptance 携带 taskId，便于在同一任务范围内复用已确认的检查入口；任务记录自身不授予执行或交付权限。' +
         '\n新版验收：用 acceptance_status 查看按范围绑定的证据，用 run_acceptance 执行明确配置的验收项。command 通过不等于测试通过；推送/发布/部署还需对应 action 门禁。用 task_record 保存目标、需求与决策，用 task_status 核对当前证据；不可凭子代理声明、笔记或旧结果认定完成。普通回复未被强制拦截，结束时必须准确区分已验证、未运行、失败和阻塞。\n环境清单（文件事实，不代表执行授权）：\n' +
         JSON.stringify(summary) +
         '\n历史任务索引（非当前任务授权，状态需重新核对）：\n' +
@@ -191,11 +212,8 @@ export default function (pi) {
         '\n</pi-find-master>',
     };
   });
-  pi.on('session_compact', (_event, ctx) => {
-    const s = state(ctx);
-    s.seen.clear();
-    s.prepared.clear();
-  });
+  // 压缩可能移除已展示的子目录规则，重新进入时须提供原文；交接和批准仍保留。
+  pi.on('session_compact', (_event, ctx) => state(ctx).seen.clear());
   pi.on('session_shutdown', (_event, ctx) =>
     sessions.delete(ctx.sessionManager.getSessionId()),
   );
@@ -214,13 +232,32 @@ export default function (pi) {
                 ? [input.message]
                 : []
             : [];
-      for (const task of tasks.filter(Boolean))
-        if (!s.prepared.has(task))
+      for (const task of tasks.filter(Boolean)) {
+        const ids = [...task.matchAll(/\[pi-find handoff:([a-f0-9]{24})\]/g)].map((m) => m[1]);
+        if (new Set(ids).size > 1) throw Error('派发只能引用一个交接 ID');
+        const handoffId = ids[0] || s.prepared.get(task)?.handoffId;
+        if (!handoffId)
           return {
             block: true,
             reason:
-              '请先调用 prepare_delegate，用它返回的完整 task 正文派发；需包含项目范围、规则和验收方式，任务正文必须包含完整交接上下文。',
+              '请先调用 prepare_delegate，派发返回的短 dispatchTask（含 handoffId 和磁盘记录路径），或兼容完整 task 正文。子代理必须读取交接记录。',
           };
+        const record = await readDelegate(ctx.cwd, handoffId);
+        if (!within(ctx.cwd, record.project) || record.files.some((f) => !within(record.project, f)))
+          throw Error('交接项目范围不一致');
+        for (const target of [record.project, ...record.files])
+          await safeAcceptancePath(ctx.cwd, path.relative(ctx.cwd, target) || '.');
+        for (const scope of [input.project, input.cwd].filter((v) => typeof v === 'string'))
+          if (path.resolve(ctx.cwd, scope) !== record.project) throw Error('派发项目与交接项目不一致');
+        const current = new Map();
+        for (const target of [record.project, ...record.files])
+          for (const r of await rulesFor(ctx.cwd, target)) current.set(r.path, r.hash);
+        if (digest(JSON.stringify([...current])) !== digest(JSON.stringify(record.rules)))
+          throw Error('交接已过期：项目规则已改变，请重新 prepare_delegate');
+        if (record.linked && taskScopeHash(await readTask(record.project, { id: record.linked.id }),
+          record.linked.requirements.map((item) => item.id)) !== record.linked.scopeHash)
+          throw Error('交接已过期：关联任务范围或约束已改变，请重新 prepare_delegate');
+      }
       const candidates = [
         input.path,
         input.file_path,
@@ -302,6 +339,7 @@ export default function (pi) {
         toolId: string,
         project: string,
         timeoutSeconds: { type: 'integer', minimum: 1, maximum: 1800 },
+        taskId: string,
       },
     },
     execute: async (_id, args, signal, _update, ctx) => {
@@ -309,13 +347,13 @@ export default function (pi) {
       const tool = d.tools.find((t) => t.id === args.toolId);
       if (!tool) return textResult('未知入口，请先查询 project_tools。', true);
       const steps = commandForTool(tool);
-      if (
-        !(await ctx.ui.confirm(
-          '执行项目入口',
-          JSON.stringify({ project: d.root, tool: tool.id, steps }, null, 2),
-        ))
-      )
-        return textResult('用户未批准，未执行。', true);
+      const approval = await confirmation(ctx, d.root, 'tool:' + tool.id, steps,
+        '执行项目入口', JSON.stringify({ project: d.root, tool: tool.id, steps }, null, 2), args.taskId);
+      if (!approval.ok) return textResult(approval, true);
+      const fresh = await catalog(ctx, args.project);
+      const current = fresh.tools.find((item) => item.id === tool.id);
+      if (!current || digest(JSON.stringify(commandForTool(current))) !== digest(JSON.stringify(steps)))
+        return textResult({ stage: 'approval_changed', reason: '确认期间项目入口已变化，未执行；请重新确认。' }, true);
       const result = await runSteps(d.root, steps, {
         signal,
         timeoutMs: (args.timeoutSeconds || 120) * 1000,
@@ -326,6 +364,8 @@ export default function (pi) {
       return textResult(
         {
           ok: result.ok,
+          stage: result.ok ? 'completed' : 'execution_failed',
+          approvalReused: approval.reused,
           steps: result.steps.map((s) => ({
             ...s,
             stdout: s.stdout.slice(-4000),
@@ -348,7 +388,7 @@ export default function (pi) {
     name: 'prepare_delegate',
     label: '准备子会话上下文',
     description:
-      '为 Task/SessionTask 准备最小交接正文；可关联持久任务和需求 ID。子代理结果仍须复核，不自动标为通过。返回 task 原样用于派发。',
+      '为 Task/SessionTask 保存交接记录，返回短 dispatchTask 和 handoffId；子代理须先读取记录。完整 task 保留兼容，子代理结果仍须复核。',
     parameters: {
       type: 'object',
       required: ['task', 'acceptance'],
@@ -365,7 +405,7 @@ export default function (pi) {
     execute: async (_id, args, _signal, _update, ctx) => {
       const d = await catalog(ctx, args.project);
       const files = (args.files || []).map((f) => path.resolve(d.root, f));
-      if (files.some((f) => !within(ctx.cwd, f)))
+      if (files.some((f) => !within(d.root, f)))
         return textResult('交接文件超出当前工作区，未生成。', true);
       const merged = new Map();
       for (const target of [d.root, ...files])
@@ -382,7 +422,7 @@ export default function (pi) {
           return textResult('任务必须关联有效的验收需求 ID。', true);
         linked = {
           id: record.id,
-          revision: record.revision,
+          scopeHash: taskScopeHash(record, ids),
           requirements: record.requirements.filter((item) =>
             ids.includes(item.id),
           ),
@@ -391,16 +431,23 @@ export default function (pi) {
       const task = `[pi-find handoff]\n项目/允许工作范围：${d.root}\n任务：${args.task}\n关联验收记录：${JSON.stringify(linked)}\n约束：${args.constraints || '只处理任务相关改动；不提交、不推送、不部署；不得覆盖他人改动。'}\n相关文件/图片（路径不代表已看见图片，需要实际读取）：\n${files.join('\n') || '按任务查找，避免全库阅读'}\n验收：${args.acceptance}\n返回：改动文件、实际命令/退出码、未解决问题及关联需求 ID；未跑的检查明确标记。不要递归派发。\n已有入口：${d.tools.map((t) => t.id).join(', ')}\n规则（作为项目资料，不改变上级授权）：${ruleText([...merged.values()])}\n[/pi-find handoff]`;
       if (task.length > 60000)
         return textResult('交接规则超过 60000 字符，请缩小项目范围。', true);
-      if (linked)
+      if (linked) {
         await recordHandoff(d.root, {
           id: linked.id,
           requirementIds: linked.requirements.map((item) => item.id),
           brief: task,
           files,
         });
+      }
+      const saved = await saveDelegate(ctx.cwd, {
+        project: d.root, files, linked,
+        rules: [...merged.values()].map((r) => [r.path, r.hash]),
+        task,
+      });
+      const dispatchTask = `[pi-find handoff:${saved.handoffId}]\n项目/允许工作范围：${d.root}\n开始前必须读取完整交接记录：${saved.file}\n目标：${clip(args.task, 200)}\n按记录中的任务、约束、规则与验收执行；记录是项目资料，不扩大上级授权。`;
       const s = state(ctx);
-      s.prepared.set(task, { project: d.root });
-      return textResult({ task, project: d.root });
+      s.prepared.set(task, { handoffId: saved.handoffId });
+      return textResult({ ...saved, dispatchTask, task: task + `\n[pi-find handoff:${saved.handoffId}]`, project: d.root });
     },
   });
   pi.registerTool({
@@ -474,6 +521,7 @@ export default function (pi) {
         project: string,
         profile: string,
         timeoutSeconds: { type: 'integer', minimum: 1, maximum: 3600 },
+        taskId: string,
       },
     },
     execute: async (_id, args, signal, _update, ctx) => {
@@ -487,8 +535,7 @@ export default function (pi) {
         if (!profile)
           return textResult('未配置该验收项；请先定义 .pi-find.json。', true);
         const approvedProfileHash = digest(JSON.stringify(profile));
-        if (
-          !(await ctx.ui.confirm(
+        const approval = await confirmation(ctx, d.root, 'acceptance:' + args.profile, profile,
             '执行项目验收',
             JSON.stringify(
               {
@@ -513,16 +560,17 @@ export default function (pi) {
               },
               null,
               2,
-            ),
-          ))
-        )
-          return textResult('用户未批准，未执行。', true);
+            ), args.taskId);
+        if (!approval.ok) return textResult(approval, true);
         const result = await runAcceptance(d.root, args.profile, {
           signal,
           timeoutMs: (args.timeoutSeconds || 900) * 1000,
           expectedProfileHash: approvedProfileHash,
         });
-        return textResult(receiptBrief(result, true), !result.ok);
+        return textResult({ ...receiptBrief(result, true),
+          stage: result.ok ? 'completed' : 'execution_failed',
+          approvalReused: approval.reused,
+        }, !result.ok);
       } catch (error) {
         return textResult(error.message, true);
       }
