@@ -1,0 +1,45 @@
+{
+  "deny": [".local/**"],
+  "acceptance": {
+    "profiles": {
+      "quality": {
+        "kind": "command",
+        "description": "检查项目 Node 脚本语法；请改成项目实际入口",
+        "include": ["scripts/**/*.mjs", ".pi-find.json"],
+        "steps": [
+          {
+            "command": "node",
+            "args": ["--check", "scripts/smoke.mjs"]
+          }
+        ]
+      },
+      "smoke": {
+        "kind": "test",
+        "description": "运行项目冒烟并生成本次 JUnit；请改成项目实际测试",
+        "include": ["scripts/**/*.mjs", ".pi-find.json"],
+        "steps": [
+          {
+            "command": "node",
+            "args": ["scripts/smoke.mjs"]
+          }
+        ],
+        "report": {
+          "format": "junit",
+          "path": ".local/pi-find/reports/smoke.xml"
+        },
+        "minPassed": 1
+      }
+    },
+    "defaultProfiles": ["quality", "smoke"],
+    "impact": [
+      {
+        "paths": ["scripts/**/*.mjs", ".pi-find.json"],
+        "profiles": ["quality", "smoke"]
+      }
+    ],
+    "gates": {
+      "push": ["quality", "smoke"],
+      "release": ["quality", "smoke"]
+    }
+  }
+}

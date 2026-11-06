@@ -1,0 +1,25 @@
+name: Portable CLI and E2E
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ['22', '24']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: CLI smoke
+        run: node src/cli.mjs --help
+      - name: Real process and Git E2E
+        run: npm run test:e2e
+      - name: Check portable package contents
+        run: npm pack --dry-run --json --cache .local/cache/npm

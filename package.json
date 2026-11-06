@@ -1,0 +1,33 @@
+{
+  "name": "pi-find-master",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Portable project tool discovery and evidence-driven acceptance gates",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "pi-find": "src/cli.mjs"
+  },
+  "files": [
+    "src/*.mjs",
+    "main.cjs",
+    "manifest.json",
+    "README.md",
+    "LICENSE",
+    "examples/",
+    "tools/install-desktop.py",
+    "tools/install-git-gates.py"
+  ],
+  "scripts": {
+    "check": "node --check src/core.mjs && node --check src/extension.mjs && node --check src/guard.mjs && node --check src/cli.mjs && node --check src/acceptance.mjs && node --check src/tasks.mjs && node --check src/planning.mjs",
+    "test:e2e": "node tests/e2e.mjs && node tests/git-hooks-e2e.mjs && node tests/acceptance-e2e.mjs && node tests/acceptance-e2e.mjs --regressions && node tests/acceptance-e2e.mjs --stdin-regression && node tests/tasks-e2e.mjs && node tests/planning-e2e.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./src/extension.mjs"
+    ]
+  }
+}
